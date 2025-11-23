@@ -27,7 +27,7 @@ from pytensor import config
 from pytensor import function as pytensor_function
 from pytensor.tensor.variable import Variable
 
-from pymc_bart.bart import BARTRV
+from pymc_bart.bart import BARTRV, BARTRVOnTables
 from pymc_bart.split_rules import ContinuousSplitRule
 from pymc_bart.tree import (
     Node,
@@ -94,6 +94,51 @@ class ParticleTree:
                     tree_grew = True
 
         return tree_grew
+    
+def sample_level(
+        self,
+        ssv,
+        available_predictors,
+        prior_prob_leaf_node,
+        X,
+        missing_data,
+        sum_trees,
+        leaf_sd,
+        m,
+        response,
+        normal,
+        shape,
+    ) -> bool:
+        level_grew = False
+        if self.expansion_nodes:
+            current_depth = get_depth(self.expansion_nodes[0])
+            # Probability that this node will remain a leaf node
+            prob_leaf = prior_prob_leaf_node[current_depth]
+
+            if prob_leaf < np.random.random():
+                new_nodes = grow_symmetric_level(
+                    self.tree,
+                    self.expansion_nodes,
+                    ssv,
+                    available_predictors,
+                    X,
+                    missing_data,
+                    sum_trees,
+                    leaf_sd,
+                    m,
+                    response,
+                    normal,
+                    shape,
+                )
+                if new_nodes:
+                    self.expansion_nodes = new_nodes
+                    level_grew = True
+                else:
+                    self.expansion_nodes = []
+            else:
+                self.expansion_nodes = []
+
+        return level_grew
 
 
 class PGBART(ArrayStepShared):
@@ -424,7 +469,7 @@ class PGBART(ArrayStepShared):
     def competence(var: pm.Distribution, has_grad: bool) -> Competence:
         """PGBART is only suitable for BART distributions."""
         dist = getattr(var.owner, "op", None)
-        if isinstance(dist, BARTRV):
+        if dist.__class__ == BARTRV:
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
 
@@ -434,7 +479,120 @@ class PGBART(ArrayStepShared):
             return {key: step_stats[key] for key in ("variable_inclusion", "tune")}
 
         return (update_stats,)
+    
+    
+class PGBARTOnTables(ArrayStepShared):
+    """
+    Particle Gibss BART on tables sampling step.
 
+    Parameters
+    ----------
+    vars: list
+        List of value variables for sampler
+    num_particles : tuple
+        Number of particles. Defaults to 10
+    batch : tuple
+        Number of trees fitted per step. The first element is the batch size during tuning and the
+        second the batch size after tuning.  Defaults to  (0.1, 0.1), meaning 10% of the `m` trees
+        during tuning and after tuning.
+    model: PyMC Model
+        Optional model for sampling step. Defaults to None (taken from context).
+    """
+
+    name = "pgbartontables"
+    def astep(self, _):
+        variable_inclusion = np.zeros(self.num_variates, dtype="int")
+
+        upper = min(self.lower + self.batch[not self.tune], self.m)
+        tree_ids = range(self.lower, upper)
+        self.lower = upper if upper < self.m else 0
+
+        for odim in range(self.trees_shape):
+            for tree_id in tree_ids:
+                self.iter += 1
+                # Compute the sum of trees without the old tree that we are attempting to replace
+                self.sum_trees_noi[odim] = (
+                    self.sum_trees[odim] - self.all_particles[odim][tree_id].tree._predict()
+                )
+                # Generate an initial set of particles
+                # at the end we return one of these particles as the new tree
+                particles = self.init_particles(tree_id, odim)
+
+                while True:
+                    # Sample each particle (try to grow each tree), except for the first one
+                    stop_growing = True
+                    for p in particles[1:]:
+                        if p.sample_level(
+                            self.ssv,
+                            self.available_predictors,
+                            self.prior_prob_leaf_node,
+                            self.X,
+                            self.missing_data,
+                            self.sum_trees[odim],
+                            self.leaf_sd[odim],
+                            self.m,
+                            self.response,
+                            self.normal,
+                            self.leaves_shape,
+                        ):
+                            self.update_weight(p, odim)
+                        if p.expansion_nodes:
+                            stop_growing = False
+                    if stop_growing:
+                        break
+
+                    # Normalize weights
+                    normalized_weights = self.normalize(particles[1:])
+
+                    # Resample
+                    particles = self.resample(particles, normalized_weights)
+
+                normalized_weights = self.normalize(particles)
+                # Get the new particle and associated tree
+                self.all_particles[odim][tree_id], new_tree = self.get_particle_tree(
+                    particles, normalized_weights
+                )
+                # Update the sum of trees
+                new = new_tree._predict()
+                self.sum_trees[odim] = self.sum_trees_noi[odim] + new
+                # To reduce memory usage, we trim the tree
+                self.all_trees[odim][tree_id] = new_tree.trim()
+
+                if self.tune:
+                    # Update the splitting variable and the splitting variable sampler
+                    if self.iter > self.m:
+                        self.ssv = SampleSplittingVariable(self.alpha_vec)
+
+                    for index in new_tree.get_split_variables():
+                        self.alpha_vec[index] += 1
+
+                    # update standard deviation at leaf nodes
+                    if self.iter > 2:
+                        self.leaf_sd[odim] = self.running_sd[odim].update(new)
+                    else:
+                        self.running_sd[odim].update(new)
+
+                else:
+                    # update the variable inclusion
+                    for index in new_tree.get_split_variables():
+                        variable_inclusion[index] += 1
+
+        if not self.tune:
+            self.bart.all_trees.append(self.all_trees)
+
+        variable_inclusion = _encode_vi(variable_inclusion)
+
+        stats = {"variable_inclusion": variable_inclusion, "tune": self.tune}
+        return self.sum_trees, [stats]
+
+    @staticmethod
+    def competence(var: pm.Distribution, has_grad: bool) -> Competence:
+        """PGBARTOnTables is only suitable for BARTOnTables distributions."""
+        dist = getattr(var.owner, "op", None)
+        if dist.__class__ == BARTRVOnTables:
+            return Competence.IDEAL
+        return Competence.INCOMPATIBLE
+    
 
 class RunningSd:
     """Welford's online algorithm for computing the variance/standard deviation"""
@@ -569,6 +727,80 @@ def grow_tree(
 
     tree.grow_leaf_node(current_node, selected_predictor, split_value, index_leaf_node)
     return current_node_children
+
+
+def grow_symmetric_level(
+    tree,
+    nodes_to_expand,
+    ssv,
+    available_predictors,
+    X,
+    missing_data,
+    sum_trees,
+    leaf_sd,
+    m,
+    response,
+    normal,
+    shape,
+):
+    representative_node_idx = nodes_to_expand[0]
+    representative_node = tree.get_node(representative_node_idx)
+    idx_data_points = representative_node.idx_data_points
+
+    index_selected_predictor = ssv.rvs()
+    selected_predictor = available_predictors[index_selected_predictor]
+    
+    _, available_splitting_values = filter_missing_values(
+        X[idx_data_points, selected_predictor], idx_data_points, missing_data
+    )
+
+    split_rule = tree.split_rules[selected_predictor]
+    split_value = split_rule.get_split_value(available_splitting_values)
+
+    if split_value is None:
+        return None
+
+    new_expansion_nodes = []
+    for node_idx in nodes_to_expand:
+        current_node = tree.get_node(node_idx)
+        
+        node_data_indices = current_node.idx_data_points
+        node_splitting_values = X[node_data_indices, selected_predictor]
+
+        to_left = split_rule.divide(node_splitting_values, split_value)
+        
+        new_idx_data_points = (
+            node_data_indices[to_left], 
+            node_data_indices[~to_left]
+        )
+
+        current_node_children_indices = (
+            get_idx_left_child(node_idx),
+            get_idx_right_child(node_idx),
+        )
+
+        for i in range(2):
+            idx_data_point = new_idx_data_points[i]
+            node_value, linear_params = draw_leaf_value(
+                y_mu_pred=sum_trees[:, idx_data_point],
+                x_mu=X[idx_data_point, selected_predictor],
+                m=m,
+                norm=normal.rvs() * leaf_sd,
+                shape=shape,
+                response=response,
+            )
+            new_node = Node.new_leaf_node(
+                value=node_value,
+                nvalue=len(idx_data_point),
+                idx_data_points=idx_data_point,
+                linear_params=linear_params,
+            )
+            tree.set_node(current_node_children_indices[i], new_node)
+            new_expansion_nodes.append(current_node_children_indices[i])
+        
+        tree.grow_leaf_node(current_node, selected_predictor, split_value, node_idx)
+
+    return new_expansion_nodes
 
 
 def filter_missing_values(available_splitting_values, idx_data_points, missing_data):

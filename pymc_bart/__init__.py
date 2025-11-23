@@ -13,8 +13,8 @@
 #   limitations under the License.
 import pymc as pm
 
-from pymc_bart.bart import BART
-from pymc_bart.pgbart import PGBART
+from pymc_bart.bart import BART, BARTOnTables
+from pymc_bart.pgbart import PGBART, PGBARTOnTables
 from pymc_bart.split_rules import ContinuousSplitRule, OneHotSplitRule, SubsetSplitRule
 from pymc_bart.utils import (
     compute_variable_importance,
@@ -30,7 +30,9 @@ from pymc_bart.utils import (
 
 __all__ = [
     "BART",
+    "BARTOnTables"
     "PGBART",
+    "PGBARTOnTables",
     "ContinuousSplitRule",
     "OneHotSplitRule",
     "SubsetSplitRule",
@@ -44,7 +46,7 @@ __all__ = [
     "plot_variable_inclusion",
     "vi_to_kulprit",
 ]
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 
-pm.STEP_METHODS = list(pm.STEP_METHODS) + [PGBART]
+pm.STEP_METHODS = list(pm.STEP_METHODS) + [PGBART, PGBARTOnTables]
