@@ -95,7 +95,7 @@ class ParticleTree:
 
         return tree_grew
     
-def sample_level(
+    def sample_level(
         self,
         ssv,
         available_predictors,
@@ -469,7 +469,7 @@ class PGBART(ArrayStepShared):
     def competence(var: pm.Distribution, has_grad: bool) -> Competence:
         """PGBART is only suitable for BART distributions."""
         dist = getattr(var.owner, "op", None)
-        if dist.__class__ == BARTRV:
+        if isinstance(dist, BARTRV) and not isinstance(dist, BARTRVOnTables):
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
 
@@ -481,7 +481,7 @@ class PGBART(ArrayStepShared):
         return (update_stats,)
     
     
-class PGBARTOnTables(ArrayStepShared):
+class PGBARTOnTables(PGBART):
     """
     Particle Gibss BART on tables sampling step.
 
@@ -589,7 +589,7 @@ class PGBARTOnTables(ArrayStepShared):
     def competence(var: pm.Distribution, has_grad: bool) -> Competence:
         """PGBARTOnTables is only suitable for BARTOnTables distributions."""
         dist = getattr(var.owner, "op", None)
-        if dist.__class__ == BARTRVOnTables:
+        if isinstance(dist, BARTRVOnTables):
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
     
@@ -742,15 +742,22 @@ def grow_symmetric_level(
     response,
     normal,
     shape,
-):
-    representative_node_idx = nodes_to_expand[0]
-    representative_node = tree.get_node(representative_node_idx)
-    idx_data_points = representative_node.idx_data_points
+): 
+    # Collect data from all nodes to find the best global split rule.
+    # This ensures symmetry — all nodes at this level use the same 
+    # splitting criteria.
+    idx_data_points = []
+    for node_idx in nodes_to_expand:
+        node = tree.get_node(node_idx)
+        idx_data_points.extend(node.idx_data_points)
+        
+    idx_data_points = np.array(idx_data_points, dtype=np.int32)
 
     index_selected_predictor = ssv.rvs()
     selected_predictor = available_predictors[index_selected_predictor]
     
-    _, available_splitting_values = filter_missing_values(
+    # Filter missing values for the combined dataset to determine split value.
+    idx_data_points, available_splitting_values = filter_missing_values(
         X[idx_data_points, selected_predictor], idx_data_points, missing_data
     )
 
@@ -764,8 +771,13 @@ def grow_symmetric_level(
     for node_idx in nodes_to_expand:
         current_node = tree.get_node(node_idx)
         
+        # Filter missing values for this specific node's data.
         node_data_indices = current_node.idx_data_points
-        node_splitting_values = X[node_data_indices, selected_predictor]
+        node_data_indices, node_splitting_values = filter_missing_values(
+            X[node_data_indices, selected_predictor],
+            node_data_indices,
+            missing_data
+        )
 
         to_left = split_rule.divide(node_splitting_values, split_value)
         
@@ -773,6 +785,10 @@ def grow_symmetric_level(
             node_data_indices[to_left], 
             node_data_indices[~to_left]
         )
+        
+        # Check to skip empty leaves - prevents division by zero in prediction.
+        if len(new_idx_data_points[0]) == 0 and len(new_idx_data_points[1]) == 0:
+            continue
 
         current_node_children_indices = (
             get_idx_left_child(node_idx),
