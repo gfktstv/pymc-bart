@@ -94,7 +94,7 @@ class ParticleTree:
                     tree_grew = True
 
         return tree_grew
-    
+
     def sample_level(
         self,
         ssv,
@@ -479,8 +479,8 @@ class PGBART(ArrayStepShared):
             return {key: step_stats[key] for key in ("variable_inclusion", "tune")}
 
         return (update_stats,)
-    
-    
+
+
 class PGBARTOnTables(PGBART):
     """
     Particle Gibss BART on tables sampling step.
@@ -500,6 +500,7 @@ class PGBARTOnTables(PGBART):
     """
 
     name = "pgbartontables"
+
     def astep(self, _):
         variable_inclusion = np.zeros(self.num_variates, dtype="int")
 
@@ -592,7 +593,7 @@ class PGBARTOnTables(PGBART):
         if isinstance(dist, BARTRVOnTables):
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
-    
+
 
 class RunningSd:
     """Welford's online algorithm for computing the variance/standard deviation"""
@@ -742,23 +743,24 @@ def grow_symmetric_level(
     response,
     normal,
     shape,
-): 
+):
     # Collect data from all nodes to find the best global split rule.
-    # This ensures symmetry — all nodes at this level use the same 
+    # This ensures symmetry — all nodes at this level use the same
     # splitting criteria.
-    idx_data_points = []
-    for node_idx in nodes_to_expand:
-        node = tree.get_node(node_idx)
-        idx_data_points.extend(node.idx_data_points)
-        
-    idx_data_points = np.array(idx_data_points, dtype=np.int32)
+    list_idx = [tree.get_node(node_idx).idx_data_points for node_idx in nodes_to_expand]
+    idx_data_points = np.concatenate(list_idx).astype(np.int32)
 
     index_selected_predictor = ssv.rvs()
     selected_predictor = available_predictors[index_selected_predictor]
-    
-    # Filter missing values for the combined dataset to determine split value.
+
+    # For optimization purposes, we cache the selected predictor column once.
+    X_col = X[:, selected_predictor]
+
+    # For optimization purposes, we cache the current values once.
+    current_values_global = X_col[idx_data_points]
+
     idx_data_points, available_splitting_values = filter_missing_values(
-        X[idx_data_points, selected_predictor], idx_data_points, missing_data
+        current_values_global, idx_data_points, missing_data
     )
 
     split_rule = tree.split_rules[selected_predictor]
@@ -770,24 +772,21 @@ def grow_symmetric_level(
     new_expansion_nodes = []
     for node_idx in nodes_to_expand:
         current_node = tree.get_node(node_idx)
-        
-        # Filter missing values for this specific node's data.
         node_data_indices = current_node.idx_data_points
+
+        node_values = X_col[node_data_indices]
+
         node_data_indices, node_splitting_values = filter_missing_values(
-            X[node_data_indices, selected_predictor],
-            node_data_indices,
-            missing_data
+            node_values, node_data_indices, missing_data
         )
 
         to_left = split_rule.divide(node_splitting_values, split_value)
-        
-        new_idx_data_points = (
-            node_data_indices[to_left], 
-            node_data_indices[~to_left]
-        )
-        
+
+        left_indices = node_data_indices[to_left]
+        right_indices = node_data_indices[~to_left]
+
         # Check to skip empty leaves - prevents division by zero in prediction.
-        if len(new_idx_data_points[0]) == 0 and len(new_idx_data_points[1]) == 0:
+        if len(left_indices) == 0 and len(right_indices) == 0:
             continue
 
         current_node_children_indices = (
@@ -795,25 +794,29 @@ def grow_symmetric_level(
             get_idx_right_child(node_idx),
         )
 
+        children_data = (left_indices, right_indices)
+
         for i in range(2):
-            idx_data_point = new_idx_data_points[i]
+            idx_child_points = children_data[i]
+
             node_value, linear_params = draw_leaf_value(
-                y_mu_pred=sum_trees[:, idx_data_point],
-                x_mu=X[idx_data_point, selected_predictor],
+                y_mu_pred=sum_trees[:, idx_child_points],
+                x_mu=X_col[idx_child_points],
                 m=m,
                 norm=normal.rvs() * leaf_sd,
                 shape=shape,
                 response=response,
             )
+
             new_node = Node.new_leaf_node(
                 value=node_value,
-                nvalue=len(idx_data_point),
-                idx_data_points=idx_data_point,
+                nvalue=len(idx_child_points),
+                idx_data_points=idx_child_points,
                 linear_params=linear_params,
             )
             tree.set_node(current_node_children_indices[i], new_node)
             new_expansion_nodes.append(current_node_children_indices[i])
-        
+
         tree.grow_leaf_node(current_node, selected_predictor, split_value, node_idx)
 
     return new_expansion_nodes
