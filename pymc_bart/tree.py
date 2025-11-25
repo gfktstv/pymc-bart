@@ -356,3 +356,135 @@ class Tree:
         else:
             self._traverse_leaf_values(leaf_values, leaf_n_values, get_idx_left_child(node_index))
             self._traverse_leaf_values(leaf_values, leaf_n_values, get_idx_right_child(node_index))
+
+
+class Table:
+    """
+    Optimized structure for Symmetric Trees (Oblivious Trees).
+    Uses flat arrays instead of graph nodes for extreme speedups.
+    """
+
+    __slots__ = (
+        "split_variables",
+        "split_values",
+        "leaf_values",
+        "split_rules",
+        "depth",
+        "n_leaves",
+        "_output_cache",
+        "shape",
+    )
+
+    def __init__(
+        self,
+        split_variables: npt.NDArray[np.int_],
+        split_values: npt.NDArray[np.float64],
+        leaf_values: npt.NDArray[np.float64],
+        split_rules: list[SplitRule],
+        shape: int = 1,
+    ) -> None:
+        self.split_variables = split_variables
+        self.split_values = split_values
+        self.leaf_values = leaf_values
+        self.split_rules = split_rules
+        self.depth = len(split_variables)
+        self.n_leaves = len(leaf_values)
+        self.shape = shape
+        self._output_cache = None
+
+    @classmethod
+    def new_table(
+        cls,
+        leaf_node_value: float,
+        num_variates: int,
+        split_rules: list[SplitRule],
+        num_observations: int = 0,
+        shape: int = 1,
+    ) -> "Table":
+        obj = cls(
+            split_variables=np.array([], dtype=int),
+            split_values=np.array([], dtype=float),
+            leaf_values=np.array([leaf_node_value], dtype=float),
+            split_rules=split_rules,
+            shape=shape,
+        )
+        if num_observations > 0:
+            # Cache is initialized to correct size (shape, N) right away.
+            obj._output_cache = np.full((shape, num_observations), leaf_node_value)
+        return obj
+
+    def copy(self) -> "Table":
+        new_obj = Table(
+            split_variables=self.split_variables.copy(),
+            split_values=self.split_values.copy(),
+            leaf_values=self.leaf_values.copy(),
+            split_rules=self.split_rules,
+            shape=self.shape,
+        )
+        if self._output_cache is not None:
+            new_obj._output_cache = self._output_cache.copy()
+        return new_obj
+
+    def get_split_variables(self) -> Generator[int, None, None]:
+        for var_idx in self.split_variables:
+            yield var_idx
+
+    def _predict(self) -> npt.NDArray:
+        """
+        Returns cached predictions for the training set.
+        Used by PGBARTOnTables inside update_weight() for max speed.
+        """
+        if self._output_cache is None:
+            # Fallback for cases where cache is not initialized.
+            return np.zeros((self.shape, 1))
+        return self._output_cache
+
+    def predict(
+        self,
+        x: npt.NDArray,
+        excluded: list[int] | None = None,
+        shape: int = 1,
+    ) -> npt.NDArray:
+        """
+        Vectorized prediction for Oblivious Tree using bitwise operations.
+        Performance: O(depth) independent of tree structure.
+        """
+        # x shape: (N_samples, n_features)
+        n_samples = x.shape[0] if x.ndim > 1 else 1
+
+        leaf_indices = np.zeros(n_samples, dtype=np.int32)
+
+        if x.ndim == 1:
+            x = x[None, :]
+
+        # For each data point, compute leaf index using bitwise operations.
+        for i in range(self.depth):
+            feat_idx = self.split_variables[i]
+            split_val = self.split_values[i]
+
+            mask = (x[:, feat_idx] > split_val).astype(np.int32)
+
+            leaf_indices |= mask << i
+
+        preds_flat = self.leaf_values[leaf_indices]
+
+        if self.shape == 1:
+            return preds_flat[None, :]
+        else:
+            return np.tile(preds_flat, (self.shape, 1))
+
+    def trim(self) -> "Table":
+        return self.copy()
+
+    def grow_level(self, split_feature, split_value, new_leaf_values, X=None):
+        """
+        Expands the table by one level and updates the internal cache.
+        """
+        self.split_variables = np.append(self.split_variables, split_feature)
+        self.split_values = np.append(self.split_values, split_value)
+        self.leaf_values = new_leaf_values
+        self.depth += 1
+        self.n_leaves = len(new_leaf_values)
+
+        if X is not None:
+            self._output_cache = self.predict(X)

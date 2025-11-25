@@ -31,6 +31,7 @@ from pymc_bart.bart import BARTRV, BARTRVOnTables
 from pymc_bart.split_rules import ContinuousSplitRule
 from pymc_bart.tree import (
     Node,
+    Table,
     Tree,
     get_depth,
     get_idx_left_child,
@@ -109,14 +110,23 @@ class ParticleTree:
         normal,
         shape,
     ) -> bool:
+        """
+        Attempts to grow the table by one full level (symmetric split).
+        """
         level_grew = False
         if self.expansion_nodes:
-            current_depth = get_depth(self.expansion_nodes[0])
-            # Probability that this node will remain a leaf node
-            prob_leaf = prior_prob_leaf_node[current_depth]
+            # Optimized way to get current depth for Table structure.
+            current_depth = self.tree.depth
+
+            # TODO: это что
+            # Проверка на макс. глубину (защита от выхода за границы массива вероятностей)
+            if current_depth < len(prior_prob_leaf_node):
+                prob_leaf = prior_prob_leaf_node[current_depth]
+            else:
+                prob_leaf = 1.0  # Принудительная остановка
 
             if prob_leaf < np.random.random():
-                new_nodes = grow_symmetric_level(
+                new_nodes = grow_table(
                     self.tree,
                     self.expansion_nodes,
                     ssv,
@@ -501,6 +511,145 @@ class PGBARTOnTables(PGBART):
 
     name = "pgbartontables"
 
+    def __init__(  # noqa: PLR0912, PLR0915
+        self,
+        vars: list[pm.Distribution] | None = None,
+        num_particles: int = 10,
+        batch: tuple[float, float] = (0.1, 0.1),
+        model: Model | None = None,
+        initial_point: PointType | None = None,
+        compile_kwargs: dict | None = None,
+        **kwargs,  # Accept additional kwargs for compound sampling
+    ) -> None:
+        model = modelcontext(model)
+        if initial_point is None:
+            initial_point = model.initial_point()
+        if vars is None:
+            vars = model.value_vars
+        else:
+            vars = [model.rvs_to_values.get(var, var) for var in vars]
+            vars = inputvars(vars)
+
+        if vars is None:
+            raise ValueError("Unable to find variables to sample")
+
+        # Filter to only BARTOnTables variables
+        bart_vars = []
+        for var in vars:
+            rv = model.values_to_rvs.get(var)
+            if (
+                rv is not None
+                and hasattr(rv.owner, "op")
+                and isinstance(rv.owner.op, BARTRVOnTables)
+            ):
+                bart_vars.append(var)
+
+        if not bart_vars:
+            raise ValueError("No BARTOnTables variables found in the provided variables")
+
+        if len(bart_vars) > 1:
+            raise ValueError(
+                "PGBARTOnTables can only handle one BARTOnTables variable at a time. "
+                "For multiple BARTOnTables variables, PyMC will automatically create "
+                "separate PGBARTOnTables samplers for each variable."
+            )
+
+        value_bart = bart_vars[0]
+        self.bart = model.values_to_rvs[value_bart].owner.op
+
+        if isinstance(self.bart.X, Variable):
+            self.X = self.bart.X.eval()
+        else:
+            self.X = self.bart.X
+
+        if isinstance(self.bart.Y, Variable):
+            self.Y = self.bart.Y.eval()
+        else:
+            self.Y = self.bart.Y
+
+        self.missing_data = np.any(np.isnan(self.X))
+        self.m = self.bart.m
+        self.response = self.bart.response
+
+        shape = initial_point[value_bart.name].shape
+
+        self.shape = 1 if len(shape) == 1 else shape[0]
+
+        # Set trees_shape (dim for separate tree structures)
+        # and leaves_shape (dim for leaf node values)
+        self.trees_shape = self.shape if self.bart.separate_trees else 1
+        self.leaves_shape = self.shape if not self.bart.separate_trees else 1
+
+        if self.bart.split_prior.size == 0:
+            self.alpha_vec = np.ones(self.X.shape[1])
+        else:
+            self.alpha_vec = self.bart.split_prior
+
+        if self.bart.split_rules:
+            self.split_rules = self.bart.split_rules
+        else:
+            self.split_rules = [ContinuousSplitRule] * self.X.shape[1]
+
+        for idx, rule in enumerate(self.split_rules):
+            if rule is ContinuousSplitRule:
+                self.X[:, idx] = jitter_duplicated(self.X[:, idx], np.nanstd(self.X[:, idx]))
+
+        init_mean = self.Y.mean()
+        self.num_observations = self.X.shape[0]
+        self.num_variates = self.X.shape[1]
+        self.available_predictors = list(range(self.num_variates))
+
+        # if data is binary
+        self.leaf_sd = np.ones((self.trees_shape, self.leaves_shape))
+
+        y_unique = np.unique(self.Y)
+        if y_unique.size == 2 and np.all(y_unique == [0, 1]):
+            self.leaf_sd *= 3 / self.m**0.5
+        else:
+            self.leaf_sd *= self.Y.std() / self.m**0.5
+
+        self.running_sd = [
+            RunningSd((self.leaves_shape, self.num_observations)) for _ in range(self.trees_shape)
+        ]
+
+        self.sum_trees = np.full(
+            (self.trees_shape, self.leaves_shape, self.Y.shape[0]), init_mean
+        ).astype(config.floatX)
+        self.sum_trees_noi = self.sum_trees - init_mean
+
+        self.a_tree = Table.new_table(
+            leaf_node_value=init_mean / self.m,
+            num_variates=self.num_variates,
+            split_rules=self.split_rules,
+            num_observations=self.num_observations,
+            shape=self.leaves_shape,
+        )
+
+        self.normal = NormalSampler(1, self.leaves_shape)
+        self.uniform = UniformSampler(0, 1)
+        self.prior_prob_leaf_node = compute_prior_probability(self.bart.alpha, self.bart.beta)
+        self.ssv = SampleSplittingVariable(self.alpha_vec)
+
+        self.tune = True
+
+        batch_0 = max(1, int(self.m * batch[0]))
+        batch_1 = max(1, int(self.m * batch[1]))
+        self.batch = (batch_0, batch_1)
+
+        self.num_particles = num_particles
+        self.indices = list(range(1, num_particles))
+        shared = make_shared_replacements(initial_point, [value_bart], model)
+        self.likelihood_logp = logp(initial_point, [model.datalogp], [value_bart], shared)
+
+        self.all_particles = [
+            [ParticleTree(self.a_tree) for _ in range(self.m)] for _ in range(self.trees_shape)
+        ]
+        self.all_trees = np.array([[p.tree for p in pl] for pl in self.all_particles])
+        self.lower = 0
+        self.iter = 0
+
+        ArrayStepShared.__init__(self, [value_bart], shared)
+
     def astep(self, _):
         variable_inclusion = np.zeros(self.num_variates, dtype="int")
 
@@ -511,16 +660,15 @@ class PGBARTOnTables(PGBART):
         for odim in range(self.trees_shape):
             for tree_id in tree_ids:
                 self.iter += 1
-                # Compute the sum of trees without the old tree that we are attempting to replace
-                self.sum_trees_noi[odim] = (
-                    self.sum_trees[odim] - self.all_particles[odim][tree_id].tree._predict()
-                )
-                # Generate an initial set of particles
-                # at the end we return one of these particles as the new tree
+
+                current_tree = self.all_particles[odim][tree_id].tree
+                pred_current = current_tree.predict(self.X)
+
+                self.sum_trees_noi[odim] = self.sum_trees[odim] - pred_current
+
                 particles = self.init_particles(tree_id, odim)
 
                 while True:
-                    # Sample each particle (try to grow each tree), except for the first one
                     stop_growing = True
                     for p in particles[1:]:
                         if p.sample_level(
@@ -542,36 +690,31 @@ class PGBARTOnTables(PGBART):
                     if stop_growing:
                         break
 
-                    # Normalize weights
                     normalized_weights = self.normalize(particles[1:])
-
-                    # Resample
                     particles = self.resample(particles, normalized_weights)
 
                 normalized_weights = self.normalize(particles)
-                # Get the new particle and associated tree
                 self.all_particles[odim][tree_id], new_tree = self.get_particle_tree(
                     particles, normalized_weights
                 )
-                # Update the sum of trees
-                new = new_tree._predict()
-                self.sum_trees[odim] = self.sum_trees_noi[odim] + new
-                # To reduce memory usage, we trim the tree
+
+                # Compute sum_trees using vectorized predict method.
+                new_pred = new_tree.predict(self.X)
+                self.sum_trees[odim] = self.sum_trees_noi[odim] + new_pred
+
                 self.all_trees[odim][tree_id] = new_tree.trim()
 
                 if self.tune:
-                    # Update the splitting variable and the splitting variable sampler
                     if self.iter > self.m:
                         self.ssv = SampleSplittingVariable(self.alpha_vec)
 
                     for index in new_tree.get_split_variables():
                         self.alpha_vec[index] += 1
 
-                    # update standard deviation at leaf nodes
                     if self.iter > 2:
-                        self.leaf_sd[odim] = self.running_sd[odim].update(new)
+                        self.leaf_sd[odim] = self.running_sd[odim].update(new_pred)
                     else:
-                        self.running_sd[odim].update(new)
+                        self.running_sd[odim].update(new_pred)
 
                 else:
                     # update the variable inclusion
@@ -730,7 +873,7 @@ def grow_tree(
     return current_node_children
 
 
-def grow_symmetric_level(
+def grow_table(
     tree,
     nodes_to_expand,
     ssv,
@@ -744,82 +887,75 @@ def grow_symmetric_level(
     normal,
     shape,
 ):
-    # Collect data from all nodes to find the best global split rule.
-    # This ensures symmetry — all nodes at this level use the same
-    # splitting criteria.
-    list_idx = [tree.get_node(node_idx).idx_data_points for node_idx in nodes_to_expand]
-    idx_data_points = np.concatenate(list_idx).astype(np.int32)
+    # Vectorized operation to compute current leaf indices.
+    # This is analougous to computing idx_data_points for each leaf node,
+    # but done for all observations at once using bitwise operations.
+    n_obs = X.shape[0]
+    current_leaf_indices = np.zeros(n_obs, dtype=np.int32)
+    for i in range(tree.depth):
+        feat = tree.split_variables[i]
+        val = tree.split_values[i]
+        mask = (X[:, feat] > val).astype(np.int32)
+        current_leaf_indices |= mask << i
 
     index_selected_predictor = ssv.rvs()
     selected_predictor = available_predictors[index_selected_predictor]
 
-    # For optimization purposes, we cache the selected predictor column once.
+    # In Table data structure we can select split_value among all values.
     X_col = X[:, selected_predictor]
-
-    # For optimization purposes, we cache the current values once.
-    current_values_global = X_col[idx_data_points]
-
-    idx_data_points, available_splitting_values = filter_missing_values(
-        current_values_global, idx_data_points, missing_data
-    )
+    if missing_data:
+        valid_mask = ~np.isnan(X_col)
+        available_values = X_col[valid_mask]
+    else:
+        available_values = X_col
 
     split_rule = tree.split_rules[selected_predictor]
-    split_value = split_rule.get_split_value(available_splitting_values)
+    split_value = split_rule.get_split_value(available_values)
 
     if split_value is None:
         return None
 
-    new_expansion_nodes = []
-    for node_idx in nodes_to_expand:
-        current_node = tree.get_node(node_idx)
-        node_data_indices = current_node.idx_data_points
+    # Compute new leaf indices after the split using bitwise operations.
+    new_bit = split_rule.divide(X_col, split_value).astype(np.int32)
 
-        node_values = X_col[node_data_indices]
+    shift = tree.depth
+    next_leaf_indices = current_leaf_indices | (new_bit << shift)
 
-        node_data_indices, node_splitting_values = filter_missing_values(
-            node_values, node_data_indices, missing_data
-        )
+    n_new_leaves = 2 ** (tree.depth + 1)
 
-        to_left = split_rule.divide(node_splitting_values, split_value)
+    # residuals: take sum_trees[0], because shape=(1, N)
+    residuals = sum_trees[0]
 
-        left_indices = node_data_indices[to_left]
-        right_indices = node_data_indices[~to_left]
+    leaf_counts = np.bincount(next_leaf_indices, minlength=n_new_leaves)
+    leaf_sums = np.bincount(next_leaf_indices, weights=residuals, minlength=n_new_leaves)
 
-        # Check to skip empty leaves - prevents division by zero in prediction.
-        if len(left_indices) == 0 and len(right_indices) == 0:
-            continue
+    nonzero = leaf_counts > 0
+    leaf_means = np.zeros(n_new_leaves)
+    leaf_means[nonzero] = leaf_sums[nonzero] / leaf_counts[nonzero]
 
-        current_node_children_indices = (
-            get_idx_left_child(node_idx),
-            get_idx_right_child(node_idx),
-        )
+    # Normal noise generation.
+    needed = n_new_leaves
 
-        children_data = (left_indices, right_indices)
+    if normal.idx + needed > normal.size:
+        normal.update()
+        if needed > normal.size:
+            raw_noise = np.random.normal(loc=0.0, scale=normal.scale, size=(normal.shape, needed))
+        else:
+            raw_noise = normal.cache[:, 0:needed]
+            normal.idx = needed
+    else:
+        raw_noise = normal.cache[:, normal.idx : normal.idx + needed]
+        normal.idx += needed
 
-        for i in range(2):
-            idx_child_points = children_data[i]
+    # flatten is needed, because shape of cache is (1, size)
+    noise = raw_noise.flatten() * leaf_sd
 
-            node_value, linear_params = draw_leaf_value(
-                y_mu_pred=sum_trees[:, idx_child_points],
-                x_mu=X_col[idx_child_points],
-                m=m,
-                norm=normal.rvs() * leaf_sd,
-                shape=shape,
-                response=response,
-            )
+    new_leaf_values_array = (leaf_means / m) + noise
 
-            new_node = Node.new_leaf_node(
-                value=node_value,
-                nvalue=len(idx_child_points),
-                idx_data_points=idx_child_points,
-                linear_params=linear_params,
-            )
-            tree.set_node(current_node_children_indices[i], new_node)
-            new_expansion_nodes.append(current_node_children_indices[i])
+    # Update table and cache.
+    tree.grow_level(selected_predictor, split_value, new_leaf_values_array, X=X)
 
-        tree.grow_leaf_node(current_node, selected_predictor, split_value, node_idx)
-
-    return new_expansion_nodes
+    return list(range(n_new_leaves))
 
 
 def filter_missing_values(available_splitting_values, idx_data_points, missing_data):
