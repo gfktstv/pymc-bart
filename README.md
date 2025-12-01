@@ -68,14 +68,14 @@ Acceleration is achieved by using NumPy arrays instead of trees to access leaves
 1. In the **Tree** data structure, to split a node, we have to copy data points in this node and create new Nodes with divided data points. In the Table data structure, we simply skip this step. To understand which data point belongs to which leaf, we calculate a bit sequence representing the path to the leaf on each split.
 2. In the Tree data structure, to predict the output of a tree for X, we have to traverse the whole tree. In the Table data structure, we simply go through levels: on each level, we get 0 or 1 depending on the predictor and split value; eventually, we get a bit sequence representing the path to the corresponding leaf.
 ## Contributors
-This project was developed within the framework of the **Yandex Education Student Camp** under the supervision of **Maxim Nikolaev** (Saint Petersburg State University).
+This project was developed within the framework of the **Yandex Education Student Camp** under the supervision of **[Maksim Nikolaev](https://github.com/ponelprinel)** (Saint Petersburg State University).
 
 **Team Members:**
-- Grigorii Feoktistov
-- Mikhail Solonko
-- Artur Filatov
-- Dmitry Sidimekov
-- Sergey Voitov
+- [Grigorii Feoktistov](https://github.com/gfktstv)
+- [Mikhail Solonko](https://github.com/DlMarsh)
+- [Artur Filatov](https://github.com/arfiev)
+- [Dmitry Sidimekov](https://github.com/sidimekov)
+- [Sergey Voitov](https://github.com/TastyButSadly)
 ## Installation
 
 To install this specific fork, you can install directly from GitHub:
