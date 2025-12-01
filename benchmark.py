@@ -1,4 +1,5 @@
 import json
+import multiprocessing as mp
 import time
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def fit_bart_and_evaluate(bart_model, X_train, y_train, X_test, y_test, m, draws
                 "R2": r2_score(y_test, y_pred_point),
             }
 
-    return metrics, y_pred_point, idata, model
+    return metrics
 
 
 def friedman_function_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -90,10 +91,10 @@ def friedman_function_test(bart_model, m=20, draws=20, tune=20, chains=1):
     X, y = make_friedman1(n_samples=1000)
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def moons_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -102,10 +103,10 @@ def moons_test(bart_model, m=20, draws=20, tune=20, chains=1):
     X, y = make_moons(n_samples=200, noise=0.2)
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def sin_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -117,10 +118,10 @@ def sin_test(bart_model, m=20, draws=20, tune=20, chains=1):
     X_test = np.linspace(-np.pi, np.pi, 200)[:, np.newaxis]
     y_test = np.sin(X_test).ravel()
 
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def cancer_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -129,10 +130,10 @@ def cancer_test(bart_model, m=20, draws=20, tune=20, chains=1):
     y = cancer.target
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def CSGO_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -140,10 +141,10 @@ def CSGO_test(bart_model, m=20, draws=20, tune=20, chains=1):
     y = CSGO_df["winnerSide"]
     X = CSGO_df.drop(columns=["winnerSide"])
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def raisin_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -153,10 +154,10 @@ def raisin_test(bart_model, m=20, draws=20, tune=20, chains=1):
     )
     X = raisin_df.drop(columns=["Class"])
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def california_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -165,10 +166,10 @@ def california_test(bart_model, m=20, draws=20, tune=20, chains=1):
     y = california.target
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 def diabetes_test(bart_model, m=20, draws=20, tune=20, chains=1):
@@ -177,10 +178,10 @@ def diabetes_test(bart_model, m=20, draws=20, tune=20, chains=1):
     y = diabetes.target
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=SEED)
-    metrics, y_pred, idata, model = fit_bart_and_evaluate(
+    metrics = fit_bart_and_evaluate(
         bart_model, X_train, y_train, X_test, y_test, m, draws, tune, chains
     )
-    return metrics, y_pred, idata, model
+    return metrics
 
 
 datasets = {
@@ -193,7 +194,24 @@ datasets = {
     "diabetes": diabetes_test,
     "raisin": raisin_test,
 }
-models = {"BART": pmb.BART, "BARTOnCatboostTrees": pmb.BARTOnTables}
+models = {"BART": pmb.BART, "BARTOnTables": pmb.BARTOnTables}
+
+
+def worker(queue, dataset_func, model_cls, params):
+    """This function runs in a separate process."""
+    try:
+        # Unpack parameters
+        chains = params["chains"]
+        draws = params["draws"]
+        tune = params["tune"]
+        m = params["m"]
+
+        # Start training
+        metrics = dataset_func(model_cls, chains=chains, draws=draws, tune=tune, m=m)
+        # Put result in queue
+        queue.put({"status": "success", "data": metrics})
+    except Exception as e:
+        queue.put({"status": "error", "error": str(e)})
 
 
 def evaluate(filename="logs", chains=2, draws=250, tune=25, m=50, runs=1):
@@ -202,31 +220,51 @@ def evaluate(filename="logs", chains=2, draws=250, tune=25, m=50, runs=1):
         LOGS_PATH = LOGS_PATH / f"{filename}_{runs}_runs"
         LOGS_PATH.mkdir(parents=True, exist_ok=True)
 
+    # Parameters to pass to the process
+    params = {"chains": chains, "draws": draws, "tune": tune, "m": m}
+
     for i in range(runs):
         logs = {}
-        logs["model_params"] = {"chains": chains, "draws": draws, "tune": tune, "m": m}
+        logs["model_params"] = params
+
         for dataset_name, dataset_func in datasets.items():
             print("==" * 20)
-            print("Dataset: ", dataset_name)
+            print(f"Run {i + 1}/{runs} | Dataset: {dataset_name}")
             print("==" * 20)
+
             logs[dataset_name] = {}
-            for model_name, model in models.items():
-                try:
-                    metrics, _, _, _ = dataset_func(
-                        model, chains=chains, draws=draws, tune=tune, m=m
-                    )
+
+            for model_name, model_cls in models.items():
+                print(f"--> Training {model_name}...")
+
+                # Create queue to receive result
+                queue = mp.Queue()
+
+                # Create process
+                # IMPORTANT: pass dataset_func and model_cls.
+                # Ensure they are importable or defined in the global scope.
+                p = mp.Process(target=worker, args=(queue, dataset_func, model_cls, params))
+
+                # Start process
+                p.start()
+
+                # Wait for result (blocking call until process returns data)
+                res = queue.get()
+
+                # Wait for process to finish
+                p.join()
+
+                # Process the result
+                if res["status"] == "success":
+                    metrics = res["data"]
                     logs[dataset_name][model_name] = metrics
-                except Exception:
-                    print(f"Partial are saved in {LOGS_PATH}/partial_{filename}.json")
+                    print(f"    Done. Metrics: {metrics}")
+                else:
+                    print(f"    ERROR in process: {res['error']}")
+                    # Save partial logs on error
                     with open(LOGS_PATH / f"partial_{filename}.json", "w") as f:
                         json.dump(logs, f, indent=4)
-
-                    raise
-
-            print("==" * 20)
-            print("Results for dataset: ", dataset_name)
-            print(logs[dataset_name])
-            print("==" * 20)
+                    raise RuntimeError(f"Training failed: {res['error']}")
 
         if runs > 1:
             with open(LOGS_PATH / f"{i}.json", "w") as f:
@@ -238,6 +276,7 @@ def evaluate(filename="logs", chains=2, draws=250, tune=25, m=50, runs=1):
 
 
 if __name__ == "__main__":
-    FILENAME = "benchmark_results"
+    # FILENAME = "benchmark_results"
     RUNS = 10
-    evaluate(filename="benchmark_results", chains=2, draws=250, tune=25, m=50, runs=RUNS)
+    # evaluate(filename="benchmark_results", chains=2, draws=250, tune=25, m=50, runs=RUNS)
+    evaluate(filename="benchmark_results_150m", chains=2, draws=250, tune=25, m=150, runs=RUNS)
